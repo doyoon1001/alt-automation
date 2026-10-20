@@ -1,40 +1,65 @@
 /**
- * Hermes Bridge — wraps the Hermes CLI (`hermes send`) so the Alt webhook
- * pipeline can deliver to Discord and Telegram through Hermes's already-
- * configured platform plugins.
- *
- * Hermes has Discord + Telegram configured in ~/.hermes/config.yaml, so we
- * don't need separate Discord/Telegram bot tokens here — we just call the CLI.
+ * Direct HTTP webhook bridge for Discord and Slack
+ * Replaces Hermes CLI with direct HTTP calls
  */
 
-const { execSync } = require("child_process");
+const https = require('https');
 
-const HERMES_BIN = process.env.HERMES_BIN || "hermes";
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
 
 /**
- * Send a message to a Hermes-configured platform.
- * @param {"telegram" | "discord" | "slack"} platform
- * @param {string} text
- * @param {{threadId?: string, channelId?: string}} [opts]
+ * Send message via HTTP webhook
  */
-function send(platform, text, opts = {}) {
-  const args = ["send", "--to", platform];
+function sendWebhook(webhookUrl, payload) {
+  return new Promise((resolve, reject) => {
+    if (!webhookUrl) {
+      return resolve({ success: false, error: 'Webhook URL not configured' });
+    }
 
-  if (opts.threadId) args.push("--thread", opts.threadId);
-  if (opts.channelId) args.push("--channel", opts.channelId);
+    const data = JSON.stringify(payload);
+    const url = new URL(webhookUrl);
 
-  args.push("--file", "-"); // read body from stdin
+    const options = {
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(data),
+      },
+    };
 
-  try {
-    execSync(`${HERMES_BIN} ${args.join(" ")}`, {
-      input: text,
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 30000,
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve({ success: true });
+        } else {
+          resolve({ success: false, error: `HTTP ${res.statusCode}: ${data}` });
+        }
+      });
     });
-    return { success: true, platform };
-  } catch (err) {
-    return { success: false, platform, error: err.message };
-  }
+
+    req.on('error', reject);
+    req.write(data);
+    req.end();
+  });
 }
 
-module.exports = { send };
+/**
+ * Send to Discord
+ */
+async function sendDiscord(text) {
+  return sendWebhook(DISCORD_WEBHOOK_URL, { content: text });
+}
+
+/**
+ * Send to Slack
+ */
+async function sendSlack(text) {
+  return sendWebhook(SLACK_WEBHOOK_URL, { text });
+}
+
+module.exports = { sendDiscord, sendSlack };

@@ -16,7 +16,7 @@ const crypto = require('crypto');
 const { execSync } = require('child_process');
 const axios = require('axios');
 const { createPage } = require('./notion.js');
-const { send: sendViaHermes } = require('./hermes-bridge.js');
+const { sendDiscord, sendSlack } = require('./hermes-bridge.js');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -189,10 +189,10 @@ app.post('/webhooks/alt', async (req, res) => {
 
   const pageUrl = notionPage.url || `https://notion.so/${notionPage.id.replace(/-/g, '')}`;
 
-  // Step 3: Hermes를 통해 Discord 채널에 Notion 링크 공유
-  console.log('[Step 3] Sharing Notion link to Discord via Hermes...');
+  // Step 3: Discord에 Notion 링크 공유
+  console.log('[Step 3] Sharing Notion link to Discord...');
   const discordMsg = `📌 **[Alt 자동 요약 완료]**\n제목: ${title}\n노션 링크: ${pageUrl}`;
-  const discordRes = sendViaHermes('discord', discordMsg);
+  const discordRes = await sendDiscord(discordMsg);
 
   if (!discordRes.success) {
     console.error('[Discord] Share failed:', discordRes.error);
@@ -201,12 +201,12 @@ app.post('/webhooks/alt', async (req, res) => {
   }
 
   // Step 4: Discord 공유 완료 후 Slack 채널에 연동 완료 알림 발송
-  console.log('[Step 4] Sending completion notification to Slack via Hermes...');
+  console.log('[Step 4] Sending completion notification to Slack...');
   const dateStr = new Date().toLocaleDateString('ko-KR', {
     year: 'numeric', month: 'long', day: 'numeric', weekday: 'long'
   });
   const slackMsg = `✅ **[${dateStr} - ${title} 요약 완료]**\n- 노션 요약본 생성 완료\n- 디스코드 공유 완료\n- 링크: ${pageUrl}`;
-  const slackRes = sendViaHermes('slack', slackMsg);
+  const slackRes = await sendSlack(slackMsg);
 
   if (!slackRes.success) {
     console.error('[Slack] Completion alert failed:', slackRes.error);
