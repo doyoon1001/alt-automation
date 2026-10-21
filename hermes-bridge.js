@@ -1,65 +1,40 @@
 /**
- * Direct HTTP webhook bridge for Discord and Slack
- * Replaces Hermes CLI with direct HTTP calls
+ * Hermes CLI bridge for Discord and Slack
+ * Uses `hermes send` CLI command instead of direct webhook calls
  */
 
-const https = require('https');
+const { execSync } = require('child_process');
 
-const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
-const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
+const HERMES_BIN = process.env.HERMES_BIN || '/root/.hermes/installs/8a4017c4cabfe15f/environments/aacddaa062d5486ea87bf528614af6f4/venv/bin/python /root/.hermes/hermes-agent/hermes';
 
 /**
- * Send message via HTTP webhook
+ * Send message via Hermes CLI
  */
-function sendWebhook(webhookUrl, payload) {
-  return new Promise((resolve, reject) => {
-    if (!webhookUrl) {
-      return resolve({ success: false, error: 'Webhook URL not configured' });
-    }
-
-    const data = JSON.stringify(payload);
-    const url = new URL(webhookUrl);
-
-    const options = {
-      hostname: url.hostname,
-      path: url.pathname + url.search,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(data),
-      },
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          resolve({ success: true });
-        } else {
-          resolve({ success: false, error: `HTTP ${res.statusCode}: ${data}` });
-        }
-      });
+function sendViaHermes(platform, text) {
+  try {
+    const output = execSync(`${HERMES_BIN} send --to ${platform} "${text.replace(/"/g, '\\"')}"`, {
+      encoding: 'utf-8',
+      timeout: 30000,
+      stdio: ['ignore', 'pipe', 'pipe']
     });
-
-    req.on('error', reject);
-    req.write(data);
-    req.end();
-  });
+    return { success: true, output: output.trim() };
+  } catch (err) {
+    return { success: false, error: err.message, stderr: err.stderr?.toString() };
+  }
 }
 
 /**
- * Send to Discord
+ * Send to Discord via Hermes CLI
  */
 async function sendDiscord(text) {
-  return sendWebhook(DISCORD_WEBHOOK_URL, { content: text });
+  return sendViaHermes('discord', text);
 }
 
 /**
- * Send to Slack
+ * Send to Slack via Hermes CLI
  */
 async function sendSlack(text) {
-  return sendWebhook(SLACK_WEBHOOK_URL, { text });
+  return sendViaHermes('slack', text);
 }
 
 module.exports = { sendDiscord, sendSlack };

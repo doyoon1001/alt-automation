@@ -23,7 +23,57 @@ const PORT = process.env.PORT || 3000;
 const ALT_WEBHOOK_SECRET = process.env.ALT_WEBHOOK_SECRET;
 const ALT_API_KEY = process.env.ALT_API_KEY;
 const HERMES_BIN = process.env.HERMES_BIN || 'hermes';
-const ALT_API_BASE = 'https://public-api.altalt.io/v1';
+const ALT_API_BASE = process.env.ALT_API_BASE || 'https://public-api.altalt.io/v1';
+
+// Required environment variables validation
+const REQUIRED_ENV = [
+  'ALT_API_KEY',
+  'ALT_WEBHOOK_SECRET',
+  'NOTION_TOKEN',
+  'NOTION_DATABASE_ID',
+];
+
+for (const key of REQUIRED_ENV) {
+  if (!process.env[key]) {
+    console.error(`[FATAL] Missing required environment variable: ${key}`);
+    process.exit(1);
+  }
+}
+
+// Idempotency: track processed note_ids to avoid duplicate processing
+const PROCESSED_FILE = '/opt/alt-automation/.alt_webhook_processed.json';
+let processedNoteIds = new Set();
+
+function loadProcessed() {
+  try {
+    const fs = require('fs');
+    if (fs.existsSync(PROCESSED_FILE)) {
+      const data = fs.readFileSync(PROCESSED_FILE, 'utf-8');
+      processedNoteIds = new Set(JSON.parse(data));
+      console.log(`[Webhook] Loaded ${processedNoteIds.size} processed note_ids from cache`);
+    }
+  } catch (e) {
+    console.warn('[Webhook] Could not load processed cache:', e.message);
+  }
+}
+
+function saveProcessed() {
+  try {
+    const fs = require('fs');
+    fs.writeFileSync(PROCESSED_FILE, JSON.stringify([...processedNoteIds]));
+  } catch (e) {
+    console.warn('[Webhook] Could not save processed cache:', e.message);
+  }
+}
+
+function markProcessed(noteId) {
+  processedNoteIds.add(noteId);
+  saveProcessed();
+}
+
+function isProcessed(noteId) {
+  return processedNoteIds.has(noteId);
+}
 
 // Prepare secret: strip "whsec_" prefix, base64url-decode the remainder
 const secretBytes = Buffer.from(
@@ -31,6 +81,9 @@ const secretBytes = Buffer.from(
   'base64url'
 );
 const TOLERANCE_SECONDS = 300;
+
+// Load processed cache on startup
+loadProcessed();
 
 // Raw body middleware for signature verification
 app.use(express.json({
@@ -78,54 +131,58 @@ function isValidSignature(req) {
   const timestamp = req.headers['webhook-timestamp'];
   const signatureHeader = req.headers['webhook-signature'];
 
-  // DEBUG: log what we received
-  console.log('[DEBUG] webhook-id:', id);
-  console.log('[DEBUG] webhook-timestamp:', timestamp);
-  console.log('[DEBUG] webhook-signature:', signatureHeader);
-  console.log('[DEBUG] rawBody:', req.rawBody ? req.rawBody.toString() : 'undefined');
-  console.log('[DEBUG] secretBytes length:', secretBytes.length);
-
-  if (!id || !timestamp || !signatureHeader) return false;
+  if (!id || !timestamp || !signatureHeader) {
+    console.error('[Signature] Missing headers:', { id, timestamp, signatureHeader });
+    return false;
+  }
 
   // Reject stale timestamps beyond ±5 minutes (replay protection)
   if (Math.abs(Date.now() / 1000 - Number(timestamp)) > TOLERANCE_SECONDS) {
-    console.log('[DEBUG] Timestamp out of range');
+    console.error('[Signature] Timestamp out of tolerance:', { timestamp, now: Date.now() / 1000 });
     return false;
   }
 
   const signedContent = `${id}.${timestamp}.${req.rawBody.toString()}`;
-  console.log('[DEBUG] signedContent:', signedContent);
+  console.log('[Signature] Signed content:', signedContent.substring(0, 200));
 
   const expected = crypto.createHmac('sha256', secretBytes)
     .update(signedContent)
     .digest('base64');
 
-  console.log('[DEBUG] expected signature:', expected);
+  console.log('[Signature] Expected (base64):', expected);
 
   // Compare against each v1,<base64> signature using constant-time comparison
-  return String(signatureHeader)
-    .split(' ')
-    .some((part) => {
-      const [version, signature] = part.split(',');
-      if (version !== 'v1' || !signature) return false;
-      const a = Buffer.from(signature);
-      const b = Buffer.from(expected);
-      return a.length === b.length && crypto.timingSafeEqual(a, b);
-    });
+  const parts = String(signatureHeader).split(' ');
+  console.log('[Signature] Received parts:', parts);
+
+  const result = parts.some((part) => {
+    const [version, signature] = part.split(',');
+    if (version !== 'v1' || !signature) return false;
+    console.log('[Signature] Checking v1 signature:', signature);
+    const a = Buffer.from(signature);
+    const b = Buffer.from(expected);
+    const match = a.length === b.length && crypto.timingSafeEqual(a, b);
+    console.log('[Signature] Match:', match);
+    return match;
+  });
+
+  if (!result) {
+    console.error('[Signature] Verification FAILED');
+  }
+  return result;
 }
 
 /**
- * Summarize raw transcript/text using Hermes CLI or built-in template
+ * Summarize raw transcript/text using Hermes CLI (oneshot mode via stdin)
  */
 function summarizeWithHermes(rawText) {
   try {
-    // Run hermes to summarize raw transcript (oneshot mode: -z "prompt")
     const prompt = `다음은 Alt에서 녹음된 내용입니다. 핵심 내용을 요약하고 실행 가능한 항목(Action Items)을 정리해주세요:\n\n${rawText}`;
-    // Escape prompt for shell
-    const escapedPrompt = prompt.replace(/"/g, '\\"').replace(/\$/g, '\\$').replace(/`/g, '\\`');
-    const output = execSync(`${HERMES_BIN} -z "${escapedPrompt}"`, {
+    const output = execSync(`${HERMES_BIN} -z`, {
+      input: prompt,
       encoding: 'utf-8',
       timeout: 60000,
+      maxBuffer: 1024 * 1024, // 1MB buffer for long responses
     });
     return output.trim();
   } catch (err) {
@@ -144,9 +201,22 @@ app.post('/webhooks/alt', async (req, res) => {
 
   const payload = req.body;
   const eventType = payload.event_type;
+  const eventId = payload.event_id;
   const noteId = payload.data?.note_id;
 
-  console.log(`[Alt Webhook] Event: ${eventType}, Note ID: ${noteId}`);
+  console.log(`[Alt Webhook] Event: ${eventType}, Event ID: ${eventId}, Note ID: ${noteId}`);
+
+  // Handle endpoint.verification challenge
+  if (eventType === 'endpoint.verification') {
+    console.log('[Alt Webhook] Verification challenge received, responding 200');
+    return res.status(200).json({ status: 'ok' });
+  }
+
+  // Idempotency check: skip if already processed THIS EVENT
+  if (eventId && isProcessed(eventId)) {
+    console.log(`[Alt Webhook] Already processed event: ${eventId}, skipping`);
+    return res.status(200).json({ status: 'skipped', reason: 'Already processed' });
+  }
 
   // Only process note.ended events
   if (eventType !== 'note.ended' || !noteId) {
@@ -214,12 +284,20 @@ app.post('/webhooks/alt', async (req, res) => {
     console.log('[Slack] Completion alert sent');
   }
 
+  // Mark event as processed (use event_id for exact delivery deduplication)
+  if (eventId) markProcessed(eventId);
+
   return res.status(200).json({
     status: 'ok',
     notionUrl: pageUrl,
     discord: discordRes.success,
     slack: slackRes.success,
   });
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'healthy', timestamp: new Date().toISOString() });
 });
 
 app.listen(PORT, () => {
